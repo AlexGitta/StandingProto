@@ -13,7 +13,7 @@ mpHands = mp.solutions.hands
 hands = mpHands.Hands()
 mpDraw = mp.solutions.drawing_utils
 
-model = mujoco.MjModel.from_xml_path("shadow_hand/right_hand.xml")
+model = mujoco.MjModel.from_xml_path("shadow_hand/scene_right.xml")
 data = mujoco.MjData(model)
 
 viewer = mujoco_viewer.MujocoViewer(model, data)
