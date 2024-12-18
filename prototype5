@@ -1,0 +1,113 @@
+import mujoco
+import glfw
+import mediapy as media
+import numpy as np
+from typing import Callable, Optional, Union, List
+import scipy.linalg
+import matplotlib.pyplot as plt
+from IPython.display import clear_output
+
+with open('./humanoid.xml', 'r') as f:
+  humanoid = f.read()
+  model = mujoco.MjModel.from_xml_string(humanoid)
+  data = mujoco.MjData(model)
+
+glfw.init()
+
+# Add global pause state
+paused = False
+
+def keyboard(window, key, scancode, act, mods):
+    global paused
+    if act == glfw.PRESS and key == glfw.KEY_ESCAPE:
+        glfw.set_window_should_close(window, True)
+    elif act == glfw.PRESS and key == glfw.KEY_BACKSPACE:
+        mujoco.mj_resetData(model, data)
+        data.time = 0.0
+    elif act == glfw.PRESS and key == glfw.KEY_SPACE:
+        paused = not paused
+    
+    # Camera movement controls
+    if key == glfw.KEY_W:
+        camera.lookat[2] -= 0.1  # Move forward
+    elif key == glfw.KEY_S:
+        camera.lookat[2] += 0.1  # Move backward
+    elif key == glfw.KEY_A:
+        camera.lookat[0] -= 0.1  # Move left
+    elif key == glfw.KEY_D:
+        camera.lookat[0] += 0.1  # Move right
+    elif key == glfw.KEY_Q:
+        camera.lookat[1] -= 0.1  # Move down
+    elif key == glfw.KEY_E:
+        camera.lookat[1] += 0.1  # Move up
+
+lastx = 0
+lasty = 0
+button_left = False
+button_right = False
+
+def mouse_button(window, button, act, mods):
+    global button_left, button_right
+    
+    if button == glfw.MOUSE_BUTTON_LEFT:
+        button_left = True if act == glfw.PRESS else False
+    if button == glfw.MOUSE_BUTTON_RIGHT:
+        button_right = True if act == glfw.PRESS else False
+
+def mouse_move(window, xpos, ypos):
+    global lastx, lasty, button_left, button_right
+    
+    if button_right:
+        dx = xpos - lastx
+        dy = ypos - lasty
+        camera.azimuth += dx * 0.1
+        camera.elevation += dy * 0.1
+    
+    lastx = xpos
+    lasty = ypos
+
+window = glfw.create_window(1200, 900, "Live Model Viewer", None, None)
+glfw.make_context_current(window)
+glfw.swap_interval(1)
+
+# Set up callback functions
+glfw.set_key_callback(window, keyboard)
+glfw.set_mouse_button_callback(window, mouse_button)
+glfw.set_cursor_pos_callback(window, mouse_move)
+
+camera = mujoco.MjvCamera()
+option = mujoco.MjvOption()
+context = mujoco.MjrContext(model, mujoco.mjtFontScale.mjFONTSCALE_150)
+scene = mujoco.MjvScene(model, maxgeom=100000)
+perturb = mujoco.MjvPerturb()
+
+mujoco.mjv_defaultCamera(camera)
+mujoco.mjv_defaultPerturb(perturb)
+mujoco.mjv_defaultOption(option)
+
+
+simstart = 0.0
+dt = 0.001
+while not glfw.window_should_close(window):
+    if not paused:
+        for ii in range(1):
+            mujoco.mj_step(model, data)
+
+    data.ctrl[0] = -1
+    viewport = mujoco.MjrRect(0, 0, 0, 0)
+    viewport.width, viewport.height = glfw.get_framebuffer_size(window)
+
+    mujoco.mjv_updateScene(
+        model,
+        data,
+        option,
+        perturb,
+        camera,
+        mujoco.mjtCatBit.mjCAT_ALL,
+        scene)
+    mujoco.mjr_render(viewport, scene, context)
+
+    glfw.swap_buffers(window)
+    glfw.poll_events()
+
+glfw.terminate()
