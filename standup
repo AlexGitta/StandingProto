@@ -1,0 +1,393 @@
+import mujoco
+import glfw
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributions import Normal
+import torch.nn.functional as F
+import pickle
+import os
+from datetime import datetime
+from collections import deque
+
+# Initialize MuJoCo simulation
+with open('./humanoid.xml', 'r') as f:
+    humanoid = f.read()
+    model = mujoco.MjModel.from_xml_string(humanoid)
+    data = mujoco.MjData(model)
+
+# Constants
+LOAD_ON_START = False
+SAVE_FILE = 'standup_progress.pkl'
+MIN_HEIGHT = 1.0  # Minimum height to consider progress
+TARGET_HEIGHT = 10.2  # Target standing height
+SUCCESS_DURATION = 100.0  # Time to maintain standing position
+MAX_EPISODE_STEPS = 1000
+EARLY_TERMINATION_HEIGHT = 0.2  # Height below which we terminate
+
+class StandupTask:
+    def __init__(self):
+        self.episode_steps = 0
+        self.total_reward = 0
+        self.best_reward = float('-inf')
+        self.best_state = None
+        self.save_file = 'standup_progress.pkl'
+        self.load_progress()
+        
+    def load_progress(self):
+        if LOAD_ON_START == True:
+            if os.path.exists(self.save_file):
+                with open(self.save_file, 'rb') as f:
+                    saved_data = pickle.load(f)
+                    self.best_reward = saved_data.get('best_reward', float('-inf'))
+                    self.best_state = saved_data.get('state', None)
+                    print(f"Loaded previous best reward: {self.best_reward}")
+
+    def save_progress(self, state):
+        if self.total_reward > self.best_reward:
+            self.best_reward = self.total_reward
+            self.best_state = {
+                'qpos': state.qpos.copy(),
+                'qvel': state.qvel.copy(),
+                'ctrl': state.ctrl.copy()
+            }
+            with open(self.save_file, 'wb') as f:
+                pickle.dump({
+                    'best_reward': self.best_reward,
+                    'state': self.best_state,
+                    'timestamp': datetime.now()
+                }, f)
+    
+    def calculate_reward(self, data):
+        torso_height = data.xpos[model.body('torso').id][2]
+        torso_upright = data.xquat[model.body('torso').id][0]
+        
+        # Positive reward for being at the right height
+        height_reward = 1.0 - abs(torso_height - TARGET_HEIGHT)
+        
+        # Positive reward for being upright (already between 0 and 1)
+        upright_reward = torso_upright
+        
+        # Make penalties smaller and bound them
+        stability_penalty = min(0.5, 0.05 * np.linalg.norm(data.qvel))
+        energy_penalty = min(0.5, 0.0005 * np.sum(np.square(data.ctrl)))
+        
+        # Combine rewards and penalties
+        reward = (height_reward + upright_reward) - (stability_penalty + energy_penalty)
+        
+        return reward
+    
+    def reset(self, data):
+        mujoco.mj_resetData(model, data)
+        self.episode_steps = 0
+        self.total_reward = 0
+        return get_state(data)
+
+class ActorCritic(nn.Module):
+    def __init__(self, num_inputs, num_outputs):
+        super().__init__()
+        
+        # Shared features
+        self.features = nn.Sequential(
+            nn.Linear(num_inputs, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU()
+        )
+        
+        # Actor (policy) head
+        self.actor_mean = nn.Linear(256, num_outputs)
+        self.actor_log_std = nn.Parameter(torch.zeros(num_outputs))  # Changed to 1D
+        
+        # Critic (value) head
+        self.critic = nn.Linear(256, 1)
+        
+        # Initialize weights
+        for layer in self.features:
+            if isinstance(layer, nn.Linear):
+                nn.init.orthogonal_(layer.weight, np.sqrt(2))
+        nn.init.orthogonal_(self.actor_mean.weight, 0.01)
+        nn.init.orthogonal_(self.critic.weight, 1)
+
+    def forward(self, x):
+        # Ensure input has batch dimension
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+            
+        features = self.features(x)
+        action_mean = self.actor_mean(features)
+        
+        # Properly handle action std for batched input
+        action_std = self.actor_log_std.exp().expand(*action_mean.size())
+        value = self.critic(features)
+        
+        return action_mean, action_std, value
+
+class Memory:
+    def __init__(self):
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.values = []
+        self.log_probs = []
+        
+    def clear(self):
+        self.states.clear()
+        self.actions.clear()
+        self.rewards.clear()
+        self.values.clear()
+        self.log_probs.clear()
+    
+    def add(self, state, action, reward, value, log_prob):
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.values.append(value)
+        self.log_probs.append(log_prob)
+
+class PPO:
+    def __init__(self, state_dim, action_dim):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.actor_critic = ActorCritic(state_dim, action_dim).to(self.device)
+        self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=3e-4)
+        
+        self.clip_param = 0.2
+        self.ppo_epochs = 10
+        self.num_mini_batch = 4
+        self.value_loss_coef = 0.5
+        self.entropy_coef = 0.01
+        
+        # Running state normalization - convert to device immediately
+        self.state_mean = torch.zeros(state_dim, device=self.device)
+        self.state_std = torch.ones(state_dim, device=self.device)
+    
+    def get_action(self, state):
+        with torch.no_grad():
+            # Add batch dimension if needed
+            state_tensor = torch.FloatTensor(state).to(self.device)
+            if state_tensor.dim() == 1:
+                state_tensor = state_tensor.unsqueeze(0)
+                
+            normalized_state = self.normalize_state(state_tensor)
+            action_mean, action_std, value = self.actor_critic(normalized_state)
+            
+            dist = Normal(action_mean, action_std)
+            action = dist.sample()
+            log_prob = dist.log_prob(action).sum(dim=-1)
+            
+            # Remove batch dimension for output
+            return action.squeeze(0).cpu().numpy(), log_prob.squeeze(0).cpu().numpy()
+    
+    def normalize_state(self, state_tensor):
+        if isinstance(state_tensor, np.ndarray):
+            state_tensor = torch.FloatTensor(state_tensor).to(self.device)
+        if state_tensor.dim() == 1:
+            state_tensor = state_tensor.unsqueeze(0)
+        return (state_tensor - self.state_mean) / (self.state_std + 1e-8)
+
+    def update_state_stats(self, state):
+        # Convert state to tensor and update running stats
+        state_tensor = torch.FloatTensor(state).to(self.device)
+        self.state_mean = 0.99 * self.state_mean + 0.01 * state_tensor.mean(dim=0)
+        self.state_std = 0.99 * self.state_std + 0.01 * state_tensor.std(dim=0)
+
+    def train(self, memory):
+        # Convert all memory items to tensors on device
+        states = torch.FloatTensor(np.array(memory.states)).to(self.device)
+        actions = torch.FloatTensor(np.array(memory.actions)).to(self.device)
+        old_log_probs = torch.FloatTensor(np.array(memory.log_probs)).to(self.device)
+        rewards = torch.FloatTensor(np.array(memory.rewards)).to(self.device)
+        values = torch.FloatTensor(np.array(memory.values)).to(self.device)
+        
+        # Normalize states before training
+        states = self.normalize_state(states)
+        
+        # Calculate advantages
+        advantages = rewards - values
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        # PPO update
+        for _ in range(self.ppo_epochs):
+            # Get current policy distributions
+            action_mean, action_std, current_value = self.actor_critic(states)
+            dist = Normal(action_mean, action_std)
+            current_log_probs = dist.log_prob(actions).sum(-1)
+            
+            # Calculate ratio and surrogate loss
+            ratio = (current_log_probs - old_log_probs).exp()
+            surr1 = ratio * advantages
+            surr2 = torch.clamp(ratio, 1-self.clip_param, 1+self.clip_param) * advantages
+            
+            # Calculate losses
+            policy_loss = -torch.min(surr1, surr2).mean()
+            value_loss = F.mse_loss(current_value.squeeze(), rewards)
+            entropy_loss = -dist.entropy().mean()
+            
+            # Total loss
+            loss = policy_loss + self.value_loss_coef * value_loss + self.entropy_coef * entropy_loss
+            
+            # Update network
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+def get_state(data):
+    # Get relevant state information
+    qpos = data.qpos[2:]  # Ignore global x,y position
+    qvel = data.qvel
+    torso_height = data.xpos[model.body('torso').id][2]
+    torso_quat = data.xquat[model.body('torso').id]
+    
+    state = np.concatenate([
+        qpos,
+        qvel,
+        [torso_height],
+        torso_quat
+    ])
+    return state
+
+def compute_reward(data):
+    torso_height = data.xpos[model.body('torso').id][2]
+    torso_upright = data.xquat[model.body('torso').id][0]  # w component of quaternion
+    
+    # Reward for height maintenance
+    height_reward = -abs(torso_height - 1.2)  # Target height of 1.2
+    
+    # Reward for being upright
+    upright_reward = torso_upright
+    
+    # Penalty for excessive movement
+    movement_penalty = -0.1 * np.linalg.norm(data.qvel)
+    
+    # Energy efficiency penalty
+    energy_penalty = -0.001 * np.sum(np.square(data.ctrl))
+    
+    return height_reward + upright_reward + movement_penalty + energy_penalty
+
+def main():
+    # Initialize GLFW and create window
+    glfw.init()
+    window = glfw.create_window(1200, 900, "Standup Task", None, None)
+    glfw.make_context_current(window)
+    glfw.swap_interval(1)
+
+    # Setup scene with original camera setup
+    camera = mujoco.MjvCamera()
+    option = mujoco.MjvOption()
+    scene = mujoco.MjvScene(model, maxgeom=100000)
+    context = mujoco.MjrContext(model, mujoco.mjtFontScale.mjFONTSCALE_150)
+
+    # Set default camera and options with adjusted distance
+    mujoco.mjv_defaultCamera(camera)
+    camera.distance = 6.0  # Increase this value to zoom out (default is usually around 3-4)
+    camera.elevation = -20  # Adjust camera angle if needed
+    mujoco.mjv_defaultOption(option)
+
+    # Initialize task and agent
+    task = StandupTask()
+    state_dim = len(get_state(data))
+    action_dim = model.nu
+    agent = PPO(state_dim, action_dim)
+    memory = Memory()
+
+    # Initialize state
+    state = task.reset(data)
+    paused = False
+
+    # Add mouse control variables
+    lastx = 0
+    lasty = 0
+    button_left = False
+    button_right = False
+
+    def keyboard(window, key, scancode, act, mods):
+        nonlocal paused
+        if act == glfw.PRESS:
+            if key == glfw.KEY_ESCAPE:
+                glfw.set_window_should_close(window, True)
+            elif key == glfw.KEY_SPACE:
+                paused = not paused
+            elif key == glfw.KEY_R:
+                state = task.reset(data)
+
+    def mouse_button(window, button, act, mods):
+        nonlocal button_left, button_right
+        
+        if button == glfw.MOUSE_BUTTON_RIGHT:
+            button_right = True if act == glfw.PRESS else False
+
+    def mouse_move(window, xpos, ypos):
+        nonlocal lastx, lasty, button_left, button_right
+        
+        if button_right:
+            dx = xpos - lastx
+            dy = ypos - lasty
+            camera.azimuth += dx * 0.1
+            camera.elevation = np.clip(camera.elevation + dy * 0.1, -90, 90)
+        
+        lastx = xpos
+        lasty = ypos
+
+    # Set up mouse callbacks
+    glfw.set_mouse_button_callback(window, mouse_button)
+    glfw.set_cursor_pos_callback(window, mouse_move)
+
+    glfw.set_key_callback(window, keyboard)
+
+    while not glfw.window_should_close(window):
+        if not paused:
+            # Get action from policy
+            action, log_prob = agent.get_action(state)
+            _, _, value = agent.actor_critic(torch.FloatTensor(agent.normalize_state(state)).to(agent.device))
+            
+            # Apply action
+            data.ctrl = np.clip(action, -1, 1)
+            mujoco.mj_step(model, data)
+            
+            # Get new state and reward
+            next_state = get_state(data)
+            reward = task.calculate_reward(data)
+            task.total_reward += reward
+            
+            # Store transition
+            memory.add(state, action, reward, value.cpu().item(), log_prob)
+            
+            # Update state stats
+            agent.update_state_stats(next_state)
+            state = next_state
+            task.episode_steps += 1
+
+            # Check episode end
+            torso_height = data.xpos[model.body('torso').id][2]
+            if torso_height < EARLY_TERMINATION_HEIGHT or task.episode_steps >= MAX_EPISODE_STEPS:
+                print(f"Episode reward: {task.total_reward}")
+                # Save progress if better than best
+                task.save_progress(data)
+                # Train if enough steps
+                if len(memory.states) >= 2048:
+                    agent.train(memory)
+                    memory.clear()
+                state = task.reset(data)
+
+        # Original rendering code
+        viewport = mujoco.MjrRect(0, 0, 0, 0)
+        viewport.width, viewport.height = glfw.get_framebuffer_size(window)
+        
+        mujoco.mjv_updateScene(
+            model,
+            data,
+            option,
+            None,
+            camera,
+            mujoco.mjtCatBit.mjCAT_ALL,
+            scene)
+        mujoco.mjr_render(viewport, scene, context)
+        
+        glfw.swap_buffers(window)
+        glfw.poll_events()
+
+    glfw.terminate()
+
+if __name__ == "__main__":
+    main()
