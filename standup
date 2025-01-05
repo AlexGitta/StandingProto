@@ -10,79 +10,122 @@ import pickle
 import os
 from datetime import datetime
 from collections import deque
+import imgui
+from imgui.integrations.glfw import GlfwRenderer
+import glob
 
 # Initialize MuJoCo simulation
-with open('./humanoid.xml', 'r') as f:
+with open('./humanoidold.xml', 'r') as f:
     humanoid = f.read()
     model = mujoco.MjModel.from_xml_string(humanoid)
     data = mujoco.MjData(model)
 
+
+
 # Constants
-LOAD_ON_START = False
-SAVE_FILE = 'standup_progress.pkl'
-MIN_HEIGHT = 1.0  # Minimum height to consider progress
-TARGET_HEIGHT = 10.2  # Target standing height
-SUCCESS_DURATION = 100.0  # Time to maintain standing position
-MAX_EPISODE_STEPS = 1000
-EARLY_TERMINATION_HEIGHT = 0.2  # Height below which we terminate
+VISUALISE = True
+HEADLESS_EPOCHS = 500
+TARGET_HEIGHT = 1.8  # Target standing height
+MAX_EPISODE_STEPS = 2048  # Max episode length
+SURVIVAL_BONUS_RATE = 0.01  # Rate at which survival bonus accumulates
+BATCH_SIZE = 1024  
+UPH_COST_WEIGHT = 0.5
+CTRL_COST_WEIGHT = 0.05
+IMPACT_COST_WEIGHT = 1e-7
+IMPACT_COST_RANGE = 10.0
+FRAME_SKIP = 5
+FRAME_TIME = 0.01
+DT = FRAME_SKIP * FRAME_TIME 
 
 class StandupTask:
     def __init__(self):
         self.episode_steps = 0
         self.total_reward = 0
-        self.best_reward = float('-inf')
-        self.best_state = None
-        self.save_file = 'standup_progress.pkl'
-        self.load_progress()
+        self.checkpoint_dir = "checkpoints"
+        if not os.path.exists(self.checkpoint_dir):
+            os.makedirs(self.checkpoint_dir)
+        self.initial_head_height = 0.0  
+        self.height_maintained_steps = 0  # Add counter for successful maintenance
+        self.height_threshold = 0.1  # How close to target height is considered successful
+        self.survival_bonus_scale = 0.001  # Scale factor for survival bonus
+    
+    def save_checkpoint(self, actor_critic, episode, reward):
+        """Save model checkpoint with timestamp"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{self.checkpoint_dir}/model_ep{episode}_{timestamp}.pt"
         
-    def load_progress(self):
-        if LOAD_ON_START == True:
-            if os.path.exists(self.save_file):
-                with open(self.save_file, 'rb') as f:
-                    saved_data = pickle.load(f)
-                    self.best_reward = saved_data.get('best_reward', float('-inf'))
-                    self.best_state = saved_data.get('state', None)
-                    print(f"Loaded previous best reward: {self.best_reward}")
-
-    def save_progress(self, state):
-        if self.total_reward > self.best_reward:
-            self.best_reward = self.total_reward
-            self.best_state = {
-                'qpos': state.qpos.copy(),
-                'qvel': state.qvel.copy(),
-                'ctrl': state.ctrl.copy()
-            }
-            with open(self.save_file, 'wb') as f:
-                pickle.dump({
-                    'best_reward': self.best_reward,
-                    'state': self.best_state,
-                    'timestamp': datetime.now()
-                }, f)
+        checkpoint = {
+            'model_state_dict': actor_critic.state_dict(),
+            'episode': episode,
+            'reward': reward,
+            'timestamp': timestamp
+        }
+        
+        try:
+            torch.save(checkpoint, filename)
+            print(f"Checkpoint saved: {filename}")
+        except Exception as e:
+            print(f"Error saving checkpoint: {e}")
+    
+    def load_checkpoint(self, actor_critic, filename):
+        """Load model from checkpoint"""
+        try:
+            checkpoint = torch.load(filename)
+            actor_critic.load_state_dict(checkpoint['model_state_dict'])
+            episode = checkpoint['episode']
+            reward = checkpoint['reward']
+            print(f"Loaded checkpoint from episode {episode}")
+            return episode, reward
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            return 0, 0
     
     def calculate_reward(self, data):
-        torso_height = data.xpos[model.body('torso').id][2]
-        torso_upright = data.xquat[model.body('torso').id][0]
+        head_heightall = data.xpos[model.body('head').id]
+        head_height1 = data.xpos[model.body('head').id][2]
+        head_height2 = data.xpos[model.body('head').id][1]
+
+        # Height reward (0 to 2)
+        uph_cost = UPH_COST_WEIGHT * (head_height1 - TARGET_HEIGHT)
+            
+
+        # Control cost (-1 to 0)
+      #  quad_ctrl_cost = CTRL_COST_WEIGHT * np.sum(np.square(data.ctrl))
+      #  quad_ctrl_cost = np.clip(quad_ctrl_cost, 0, 1)
         
-        # Positive reward for being at the right height
-        height_reward = 1.0 - abs(torso_height - TARGET_HEIGHT)
+        # Impact cost (-0.5 to 0)
+      #  impact_forces = np.sum(np.square(data.cfrc_ext))
+     #   quad_impact_cost = IMPACT_COST_WEIGHT * min(impact_forces, IMPACT_COST_RANGE)
+      #  quad_impact_cost = np.clip(quad_impact_cost, 0, 0.5)
         
-        # Positive reward for being upright (already between 0 and 1)
-        upright_reward = torso_upright
+        # Final reward (-1.5 to 2)
+        reward = uph_cost # quad_ctrl_cost - quad_impact_cost
         
-        # Make penalties smaller and bound them
-        stability_penalty = min(0.5, 0.05 * np.linalg.norm(data.qvel))
-        energy_penalty = min(0.5, 0.0005 * np.sum(np.square(data.ctrl)))
+        #if self.episode_steps % 100 == 0:
+         #   print(f"Height: {head_height:.2f}, Reward Components: Height={uph_cost:.2f}, Control={-quad_ctrl_cost:.2f}, Impact={-quad_impact_cost:.2f}")
         
-        # Combine rewards and penalties
-        reward = (height_reward + upright_reward) - (stability_penalty + energy_penalty)
         
+        if(self.episode_steps % 100 == 0 and VISUALISE):
+            print(f"Heightall: {head_heightall})")      
+            print(f"Height1: {head_height1})")
+            print(f"Height2: {head_height2})")
+            print(f"Reward: {reward:.2f}")
+            
+
         return reward
     
     def reset(self, data):
-        mujoco.mj_resetData(model, data)
-        self.episode_steps = 0
-        self.total_reward = 0
-        return get_state(data)
+            # Use the standing pose from keyframes (index 6 for "standing_default")
+            standing_pose = model.key_qpos[4]  # Direct index access instead of name lookup
+            data.qpos[:] = standing_pose
+            data.qvel[:] = 0
+            mujoco.mj_forward(model, data)
+            
+            self.initial_head_height = data.xpos[model.body('head').id][2]
+            self.episode_steps = 0
+            self.total_reward = 0
+            self.height_maintained_steps = 0
+            return get_state(data)
 
 class ActorCritic(nn.Module):
     def __init__(self, num_inputs, num_outputs):
@@ -150,13 +193,12 @@ class PPO:
     def __init__(self, state_dim, action_dim):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.actor_critic = ActorCritic(state_dim, action_dim).to(self.device)
-        self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=3e-4)
+        self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=0.0005)
         
-        self.clip_param = 0.2
-        self.ppo_epochs = 10
-        self.num_mini_batch = 4
-        self.value_loss_coef = 0.5
-        self.entropy_coef = 0.01
+        self.clip_param = 0.3
+        self.ppo_epochs = 100   
+        self.value_loss_coef = 0.3
+        self.entropy_coef = 0.03 
         
         # Running state normalization - convert to device immediately
         self.state_mean = torch.zeros(state_dim, device=self.device)
@@ -234,160 +276,216 @@ class PPO:
 
 def get_state(data):
     # Get relevant state information
-    qpos = data.qpos[2:]  # Ignore global x,y position
-    qvel = data.qvel
-    torso_height = data.xpos[model.body('torso').id][2]
-    torso_quat = data.xquat[model.body('torso').id]
-    
-    state = np.concatenate([
-        qpos,
-        qvel,
-        [torso_height],
-        torso_quat
+        return np.concatenate([
+        data.qpos.flat[2:],  # Skip root x/y coordinates
+        data.qvel.flat,
+        data.cinert.flat,
+        data.cvel.flat,
+        data.qfrc_actuator.flat,
+        data.cfrc_ext.flat,
     ])
-    return state
 
-def compute_reward(data):
-    torso_height = data.xpos[model.body('torso').id][2]
-    torso_upright = data.xquat[model.body('torso').id][0]  # w component of quaternion
-    
-    # Reward for height maintenance
-    height_reward = -abs(torso_height - 1.2)  # Target height of 1.2
-    
-    # Reward for being upright
-    upright_reward = torso_upright
-    
-    # Penalty for excessive movement
-    movement_penalty = -0.1 * np.linalg.norm(data.qvel)
-    
-    # Energy efficiency penalty
-    energy_penalty = -0.001 * np.sum(np.square(data.ctrl))
-    
-    return height_reward + upright_reward + movement_penalty + energy_penalty
-
-def main():
-    # Initialize GLFW and create window
-    glfw.init()
-    window = glfw.create_window(1200, 900, "Standup Task", None, None)
-    glfw.make_context_current(window)
-    glfw.swap_interval(1)
-
-    # Setup scene with original camera setup
-    camera = mujoco.MjvCamera()
-    option = mujoco.MjvOption()
-    scene = mujoco.MjvScene(model, maxgeom=100000)
-    context = mujoco.MjrContext(model, mujoco.mjtFontScale.mjFONTSCALE_150)
-
-    # Set default camera and options with adjusted distance
-    mujoco.mjv_defaultCamera(camera)
-    camera.distance = 6.0  # Increase this value to zoom out (default is usually around 3-4)
-    camera.elevation = -20  # Adjust camera angle if needed
-    mujoco.mjv_defaultOption(option)
-
-    # Initialize task and agent
+def train_headless(episodes = HEADLESS_EPOCHS, max_steps = 1000, print_steps = 10):
     task = StandupTask()
     state_dim = len(get_state(data))
     action_dim = model.nu
     agent = PPO(state_dim, action_dim)
     memory = Memory()
-
-    # Initialize state
+    
     state = task.reset(data)
-    paused = False
+    
+    for episode in range(episodes):
+        state = task.reset(data)  
+        episode_reward = 0
 
-    # Add mouse control variables
-    lastx = 0
-    lasty = 0
-    button_left = False
-    button_right = False
 
-    def keyboard(window, key, scancode, act, mods):
-        nonlocal paused
-        if act == glfw.PRESS:
-            if key == glfw.KEY_ESCAPE:
-                glfw.set_window_should_close(window, True)
-            elif key == glfw.KEY_SPACE:
-                paused = not paused
-            elif key == glfw.KEY_R:
-                state = task.reset(data)
-
-    def mouse_button(window, button, act, mods):
-        nonlocal button_left, button_right
-        
-        if button == glfw.MOUSE_BUTTON_RIGHT:
-            button_right = True if act == glfw.PRESS else False
-
-    def mouse_move(window, xpos, ypos):
-        nonlocal lastx, lasty, button_left, button_right
-        
-        if button_right:
-            dx = xpos - lastx
-            dy = ypos - lasty
-            camera.azimuth += dx * 0.1
-            camera.elevation = np.clip(camera.elevation + dy * 0.1, -90, 90)
-        
-        lastx = xpos
-        lasty = ypos
-
-    # Set up mouse callbacks
-    glfw.set_mouse_button_callback(window, mouse_button)
-    glfw.set_cursor_pos_callback(window, mouse_move)
-
-    glfw.set_key_callback(window, keyboard)
-
-    while not glfw.window_should_close(window):
-        if not paused:
-            # Get action from policy
+        for step in range(max_steps):
             action, log_prob = agent.get_action(state)
             _, _, value = agent.actor_critic(torch.FloatTensor(agent.normalize_state(state)).to(agent.device))
             
-            # Apply action
             data.ctrl = np.clip(action, -1, 1)
             mujoco.mj_step(model, data)
-            
-            # Get new state and reward
             next_state = get_state(data)
             reward = task.calculate_reward(data)
-            task.total_reward += reward
+
+            episode_reward += reward  # Accumulate episode reward
             
-            # Store transition
             memory.add(state, action, reward, value.cpu().item(), log_prob)
-            
-            # Update state stats
             agent.update_state_stats(next_state)
             state = next_state
-            task.episode_steps += 1
+            
+            if len(memory.states) >= BATCH_SIZE:  
+                agent.train(memory)
+                memory.clear()
+            
+            if step >= MAX_EPISODE_STEPS:
+                break
 
-            # Check episode end
-            torso_height = data.xpos[model.body('torso').id][2]
-            if torso_height < EARLY_TERMINATION_HEIGHT or task.episode_steps >= MAX_EPISODE_STEPS:
-                print(f"Episode reward: {task.total_reward}")
-                # Save progress if better than best
-                task.save_progress(data)
-                # Train if enough steps
-                if len(memory.states) >= 2048:
-                    agent.train(memory)
-                    memory.clear()
-                state = task.reset(data)
+        if episode % print_steps == 0:
+            print(f"Episode {episode}, Reward: {episode_reward/max_steps:.3f}")
 
-        # Original rendering code
-        viewport = mujoco.MjrRect(0, 0, 0, 0)
-        viewport.width, viewport.height = glfw.get_framebuffer_size(window)
+
+    task.save_checkpoint(agent.actor_critic, episode, task.total_reward)      
+
+def main():
+    if VISUALISE:
+
+        # Initialize GLFW and create window
+        count = 0
+        glfw.init()
+        window = glfw.create_window(1200, 900, "Standup Task", None, None)
+        glfw.make_context_current(window)
+        glfw.swap_interval(1)
+
+        # Setup scene with original camera setup
+        camera = mujoco.MjvCamera()
+        option = mujoco.MjvOption()
+        scene = mujoco.MjvScene(model, maxgeom=100000)
+        context = mujoco.MjrContext(model, mujoco.mjtFontScale.mjFONTSCALE_150)
+
+        # Set default camera and options with adjusted angle
+        mujoco.mjv_defaultCamera(camera)
+        camera.distance = 6.0
+        camera.azimuth = 180 
+        camera.elevation = -20
+        mujoco.mjv_defaultOption(option)
+
+        # Initialize task and agent
+        task = StandupTask()
+        state_dim = len(get_state(data))
+        action_dim = model.nu
+        agent = PPO(state_dim, action_dim)
+        memory = Memory()
+
+        # Initialize state
+        state = task.reset(data)
+        paused = False
+
+        # Remove unused mouse variables
+        lastx = 0
+        lasty = 0
+        button_left = False
+        button_right = False
+
+        def keyboard(window, key, scancode, act, mods):
+            nonlocal paused
+            if act == glfw.PRESS or act == glfw.REPEAT:  # Handle key repeats
+                if key == glfw.KEY_ESCAPE:
+                    glfw.set_window_should_close(window, True)
+                elif key == glfw.KEY_SPACE:
+                    paused = not paused
+                elif key == glfw.KEY_S:
+                    task.save_checkpoint(agent.actor_critic, count, task.total_reward)
+                # Add camera rotation controls
+                elif key == glfw.KEY_LEFT:
+                    camera.azimuth = (camera.azimuth + 5) % 360
+                elif key == glfw.KEY_RIGHT:
+                    camera.azimuth = (camera.azimuth - 5) % 360
+
+        glfw.set_key_callback(window, keyboard)
+
+        # Initialize ImGui
+        imgui.create_context()
+        impl = GlfwRenderer(window)
         
-        mujoco.mjv_updateScene(
-            model,
-            data,
-            option,
-            None,
-            camera,
-            mujoco.mjtCatBit.mjCAT_ALL,
-            scene)
-        mujoco.mjr_render(viewport, scene, context)
+        # Add checkpoint list state
+        checkpoint_files = []
+        selected_checkpoint = -1
         
-        glfw.swap_buffers(window)
-        glfw.poll_events()
+        def update_checkpoint_list():
+            nonlocal checkpoint_files
+            checkpoint_files = glob.glob(os.path.join("checkpoints", "*.pt"))
+            checkpoint_files.sort(key=os.path.getctime, reverse=True)  # Sort by creation time
 
-    glfw.terminate()
+        update_checkpoint_list()
+
+        while not glfw.window_should_close(window):
+            if not paused:
+                # Get action from policy
+                action, log_prob = agent.get_action(state)
+                _, _, value = agent.actor_critic(torch.FloatTensor(agent.normalize_state(state)).to(agent.device))
+                
+                # Apply action and get reward
+                data.ctrl = np.clip(action, -1, 1)
+                mujoco.mj_step(model, data)
+                next_state = get_state(data)
+                reward = task.calculate_reward(data)
+                
+                # print instantaneous reward for debugging
+               # print(f"Step {task.episode_steps}, Reward: {reward:.3f}")
+                
+                task.total_reward += reward/MAX_EPISODE_STEPS  # Normalize by episode length
+                
+                # Store transition
+                memory.add(state, action, reward, value.cpu().item(), log_prob)
+                
+                # Update state stats
+                agent.update_state_stats(next_state)
+                state = next_state
+                task.episode_steps += 1
+
+                # Check episode end
+                torso_height = data.xpos[model.body('torso').id][2]
+                if task.episode_steps >= MAX_EPISODE_STEPS:
+                    count = count + 1
+                    print(f"Episode " +str(count)+ " ended after ", task.episode_steps, "steps")
+                    print(f"Average episode reward: {task.total_reward:.3f}")
+              
+                    if len(memory.states) >= BATCH_SIZE:  
+                        agent.train(memory)
+                        memory.clear()
+                    state = task.reset(data)
+
+            # Start ImGui frame
+            impl.process_inputs()
+            imgui.new_frame()
+
+            # Create checkpoint selector window
+            imgui.begin("Checkpoint Selector", True)
+            imgui.set_window_size(300, 200, imgui.FIRST_USE_EVER)
+            
+            if imgui.button("Refresh List"):
+                update_checkpoint_list()
+            
+            imgui.separator()
+            
+            for i, checkpoint_path in enumerate(checkpoint_files):
+                filename = os.path.basename(checkpoint_path)
+                if imgui.selectable(filename, selected_checkpoint == i)[0]:
+                    selected_checkpoint = i
+                    episode, reward = task.load_checkpoint(agent.actor_critic, checkpoint_path)
+            
+            imgui.end()
+
+            # Render ImGui
+            imgui.render()
+            
+            # Original rendering code
+            viewport = mujoco.MjrRect(0, 0, 0, 0)
+            viewport.width, viewport.height = glfw.get_framebuffer_size(window)
+            
+            mujoco.mjv_updateScene(
+                model,
+                data,
+                option,
+                None,
+                camera,
+                mujoco.mjtCatBit.mjCAT_ALL,
+                scene)
+            mujoco.mjr_render(viewport, scene, context)
+            
+            # Render ImGui over MuJoCo
+            impl.render(imgui.get_draw_data())
+            
+            glfw.swap_buffers(window)
+            glfw.poll_events()
+
+        # Cleanup
+        impl.shutdown()
+        glfw.terminate()
+    
+    else:
+        train_headless()
 
 if __name__ == "__main__":
     main()
