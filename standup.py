@@ -6,13 +6,13 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Normal
 import torch.nn.functional as F
-import pickle
 import os
 from datetime import datetime
-from collections import deque
 import imgui
 from imgui.integrations.glfw import GlfwRenderer
 import glob
+import matplotlib.pyplot as plt
+
 
 # Initialize MuJoCo simulation
 with open('./humanoidold.xml', 'r') as f:
@@ -24,46 +24,41 @@ with open('./humanoidold.xml', 'r') as f:
 
 # Constants
 VISUALISE = True
-HEADLESS_EPOCHS = 500
 TARGET_HEIGHT = 1.8  # Target standing height
-MAX_EPISODE_STEPS = 2048  # Max episode length
-SURVIVAL_BONUS_RATE = 0.01  # Rate at which survival bonus accumulates
-BATCH_SIZE = 1024  
-UPH_COST_WEIGHT = 0.5
-CTRL_COST_WEIGHT = 0.05
+SAVE_INTERVAL = 100000
+TRAIN_INTERVAL = 512
+MAX_STEPS = 1000000
+UPH_COST_WEIGHT = 1.5
+CTRL_COST_WEIGHT = 0.00
 IMPACT_COST_WEIGHT = 1e-7
 IMPACT_COST_RANGE = 10.0
-FRAME_SKIP = 5
-FRAME_TIME = 0.01
-DT = FRAME_SKIP * FRAME_TIME 
 
 class StandupTask:
     def __init__(self):
-        self.episode_steps = 0
+        self.total_steps = 0
         self.total_reward = 0
         self.checkpoint_dir = "checkpoints"
         if not os.path.exists(self.checkpoint_dir):
             os.makedirs(self.checkpoint_dir)
-        self.initial_head_height = 0.0  
         self.height_maintained_steps = 0  # Add counter for successful maintenance
         self.height_threshold = 0.1  # How close to target height is considered successful
         self.survival_bonus_scale = 0.001  # Scale factor for survival bonus
     
-    def save_checkpoint(self, actor_critic, episode, reward):
+    def save_checkpoint(self, actor_critic, steps, reward):
         """Save model checkpoint with timestamp"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{self.checkpoint_dir}/model_ep{episode}_{timestamp}.pt"
+        filename = f"{self.checkpoint_dir}/model_steps{steps}_{timestamp}.pt"
         
         checkpoint = {
             'model_state_dict': actor_critic.state_dict(),
-            'episode': episode,
+            'steps': steps,
             'reward': reward,
             'timestamp': timestamp
         }
         
         try:
             torch.save(checkpoint, filename)
-            print(f"Checkpoint saved: {filename}")
+            print(f"Checkpoint saved at step {steps}: {filename}")
         except Exception as e:
             print(f"Error saving checkpoint: {e}")
     
@@ -72,10 +67,9 @@ class StandupTask:
         try:
             checkpoint = torch.load(filename)
             actor_critic.load_state_dict(checkpoint['model_state_dict'])
-            episode = checkpoint['episode']
             reward = checkpoint['reward']
-            print(f"Loaded checkpoint from episode {episode}")
-            return episode, reward
+            print(f"Loaded checkpoint from step {checkpoint['steps']}")
+            return reward
         except Exception as e:
             print(f"Error loading checkpoint: {e}")
             return 0, 0
@@ -85,13 +79,13 @@ class StandupTask:
         head_height1 = data.xpos[model.body('head').id][2]
         head_height2 = data.xpos[model.body('head').id][1]
 
-        # Height reward (0 to 2)
-        uph_cost = UPH_COST_WEIGHT * (head_height1 - TARGET_HEIGHT)
+        # Height reward 
+        uph_cost = (UPH_COST_WEIGHT * (head_height1 - TARGET_HEIGHT)) + 1
             
 
         # Control cost (-1 to 0)
-      #  quad_ctrl_cost = CTRL_COST_WEIGHT * np.sum(np.square(data.ctrl))
-      #  quad_ctrl_cost = np.clip(quad_ctrl_cost, 0, 1)
+        quad_ctrl_cost = CTRL_COST_WEIGHT * np.sum(np.square(data.ctrl))
+        quad_ctrl_cost = np.clip(quad_ctrl_cost, 0, 1)
         
         # Impact cost (-0.5 to 0)
       #  impact_forces = np.sum(np.square(data.cfrc_ext))
@@ -99,29 +93,30 @@ class StandupTask:
       #  quad_impact_cost = np.clip(quad_impact_cost, 0, 0.5)
         
         # Final reward (-1.5 to 2)
-        reward = uph_cost # quad_ctrl_cost - quad_impact_cost
+        reward = uph_cost - quad_ctrl_cost # - quad_impact_cost
         
         #if self.episode_steps % 100 == 0:
          #   print(f"Height: {head_height:.2f}, Reward Components: Height={uph_cost:.2f}, Control={-quad_ctrl_cost:.2f}, Impact={-quad_impact_cost:.2f}")
         
         
-        if(self.episode_steps % 100 == 0 and VISUALISE):
-            print(f"Heightall: {head_heightall})")      
+        if(self.total_steps % 1000 == 0 and VISUALISE):
+            print(f"Distance from target: {head_height1 - TARGET_HEIGHT:.2f}")   
+            print(f"Control Cost: {quad_ctrl_cost}")
             print(f"Height1: {head_height1})")
-            print(f"Height2: {head_height2})")
+            print(f"UPH Cost: {uph_cost}")
             print(f"Reward: {reward:.2f}")
             
 
-        return reward
+        return reward, head_height1
     
     def reset(self, data):
-            # Use the standing pose from keyframes (index 6 for "standing_default")
-            standing_pose = model.key_qpos[4]  # Direct index access instead of name lookup
-            data.qpos[:] = standing_pose
+            # Use the supine pose 
+            starting_pose = model.key_qpos[5]  
+            data.qpos[:] = starting_pose
             data.qvel[:] = 0
             mujoco.mj_forward(model, data)
             
-            self.initial_head_height = data.xpos[model.body('head').id][2]
+           
             self.episode_steps = 0
             self.total_reward = 0
             self.height_maintained_steps = 0
@@ -192,13 +187,14 @@ class Memory:
 class PPO:
     def __init__(self, state_dim, action_dim):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
         self.actor_critic = ActorCritic(state_dim, action_dim).to(self.device)
         self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=0.0005)
         
-        self.clip_param = 0.3
-        self.ppo_epochs = 100   
-        self.value_loss_coef = 0.3
-        self.entropy_coef = 0.03 
+        self.clip_param = 0.2 # increase if stuck in local minima
+        self.ppo_epochs = 10  # increase if training too slowly
+        self.value_loss_coef = 0.5
+        self.entropy_coef = 0.1 # increase for more exploration
         
         # Running state normalization - convert to device immediately
         self.state_mean = torch.zeros(state_dim, device=self.device)
@@ -285,7 +281,7 @@ def get_state(data):
         data.cfrc_ext.flat,
     ])
 
-def train_headless(episodes = HEADLESS_EPOCHS, max_steps = 1000, print_steps = 10):
+def train_headless():
     task = StandupTask()
     state_dim = len(get_state(data))
     action_dim = model.nu
@@ -293,39 +289,83 @@ def train_headless(episodes = HEADLESS_EPOCHS, max_steps = 1000, print_steps = 1
     memory = Memory()
     
     state = task.reset(data)
+    cumulative_reward = 0
+
+    rewards_history = []
+    heights_history = []
     
-    for episode in range(episodes):
-        state = task.reset(data)  
-        episode_reward = 0
+    while task.total_steps < MAX_STEPS:
+        # Get action and value
+        action, log_prob = agent.get_action(state)
+        _, _, value = agent.actor_critic(torch.FloatTensor(agent.normalize_state(state)).to(agent.device))
+        
+        # Execute action
+        data.ctrl = np.clip(action, -1, 1)
+       # data.ctrl = action
+        mujoco.mj_step(model, data)
+        next_state = get_state(data)
+        reward, height = task.calculate_reward(data)
 
-
-        for step in range(max_steps):
-            action, log_prob = agent.get_action(state)
-            _, _, value = agent.actor_critic(torch.FloatTensor(agent.normalize_state(state)).to(agent.device))
+               # Update stats
+        
+        task.total_steps += 1
+        
+        # Store transition
+        memory.add(state, action, reward, value.cpu().item(), log_prob)
+        agent.update_state_stats(next_state)
+        state = next_state
+        
+        # Train periodically
+        if len(memory.states) >= TRAIN_INTERVAL:
+            agent.train(memory)
+            memory.clear()
             
-            data.ctrl = np.clip(action, -1, 1)
-            mujoco.mj_step(model, data)
-            next_state = get_state(data)
-            reward = task.calculate_reward(data)
-
-            episode_reward += reward  # Accumulate episode reward
+        # Save checkpoint periodically
+        if task.total_steps % SAVE_INTERVAL == 0:
             
-            memory.add(state, action, reward, value.cpu().item(), log_prob)
-            agent.update_state_stats(next_state)
-            state = next_state
+            task.save_checkpoint(agent.actor_critic, task.total_steps, reward)
+           
             
-            if len(memory.states) >= BATCH_SIZE:  
-                agent.train(memory)
-                memory.clear()
-            
-            if step >= MAX_EPISODE_STEPS:
-                break
+        # Print progress
+        if task.total_steps % 1000 == 0:
+            print(f"Step {task.total_steps}, Recent Reward: {reward:.3f}, Recent Height: {height:.3f}")
+            rewards_history.append(reward)
+            heights_history.append(height)
 
-        if episode % print_steps == 0:
-            print(f"Episode {episode}, Reward: {episode_reward/max_steps:.3f}")
+    # After training, create and save plots
+    window = 1000  # Moving average window
+    
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+    
+    # Create plots at end of training
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+    
+    ax1.plot(rewards_history, 'b-')
+    ax1.set_title('Training Rewards')
+    ax1.set_xlabel('Steps')
+    ax1.set_ylabel('Reward')
+    
+    ax2.plot(heights_history, 'r-')
+    ax2.axhline(y=TARGET_HEIGHT, color='g', linestyle='--', label='Target')
+    ax2.set_title('Head Height')
+    ax2.set_xlabel('Steps')
+    ax2.set_ylabel('Height')
+    ax2.legend()
+    
+    plt.tight_layout()
+    plt.savefig('training_results.png')
+    plt.close()
 
 
-    task.save_checkpoint(agent.actor_critic, episode, task.total_reward)      
+def center_camera_on_humanoid(camera, data, model):
+    # Get torso position
+    torso_pos = data.xpos[model.body('torso').id]
+    
+    # Update camera lookat to track torso
+    camera.lookat[0] = torso_pos[0]  # x
+    camera.lookat[1] = torso_pos[1]  # y
+    camera.lookat[2] = torso_pos[2]  # z
+
 
 def main():
     if VISUALISE:
@@ -405,42 +445,44 @@ def main():
                 action, log_prob = agent.get_action(state)
                 _, _, value = agent.actor_critic(torch.FloatTensor(agent.normalize_state(state)).to(agent.device))
                 
-                # Apply action and get reward
+                # Execute action
                 data.ctrl = np.clip(action, -1, 1)
+               # data.ctrl = action
                 mujoco.mj_step(model, data)
                 next_state = get_state(data)
-                reward = task.calculate_reward(data)
+                reward, height = task.calculate_reward(data)
                 
-                # print instantaneous reward for debugging
-               # print(f"Step {task.episode_steps}, Reward: {reward:.3f}")
-                
-                task.total_reward += reward/MAX_EPISODE_STEPS  # Normalize by episode length
+                task.total_steps += 1
+                task.total_reward += reward
                 
                 # Store transition
                 memory.add(state, action, reward, value.cpu().item(), log_prob)
-                
-                # Update state stats
                 agent.update_state_stats(next_state)
                 state = next_state
-                task.episode_steps += 1
 
-                # Check episode end
-                torso_height = data.xpos[model.body('torso').id][2]
-                if task.episode_steps >= MAX_EPISODE_STEPS:
-                    count = count + 1
-                    print(f"Episode " +str(count)+ " ended after ", task.episode_steps, "steps")
-                    print(f"Average episode reward: {task.total_reward:.3f}")
-              
-                    if len(memory.states) >= BATCH_SIZE:  
-                        agent.train(memory)
-                        memory.clear()
-                    state = task.reset(data)
+                # Train periodically
+                if len(memory.states) >= TRAIN_INTERVAL:
+                    agent.train(memory)
+                    memory.clear()
+                
+                # Save checkpoint periodically
+                if task.total_steps % SAVE_INTERVAL == 0:
+                    task.save_checkpoint(agent.actor_critic, task.total_steps, task.total_reward/SAVE_INTERVAL)
 
+            center_camera_on_humanoid(camera,data,model)
             # Start ImGui frame
             impl.process_inputs()
             imgui.new_frame()
 
+            imgui.set_next_window_position(10, 10, imgui.ONCE)
+            imgui.begin("Simulation Stats", True)
+            imgui.set_window_size(200, 100, imgui.FIRST_USE_EVER)
+            imgui.text(f"Steps: {task.total_steps}")
+            imgui.text(f"Current Reward: {reward:.3f}")
+            imgui.end()
+
             # Create checkpoint selector window
+            imgui.set_next_window_position(10, 100, imgui.ONCE)
             imgui.begin("Checkpoint Selector", True)
             imgui.set_window_size(300, 200, imgui.FIRST_USE_EVER)
             
@@ -453,7 +495,7 @@ def main():
                 filename = os.path.basename(checkpoint_path)
                 if imgui.selectable(filename, selected_checkpoint == i)[0]:
                     selected_checkpoint = i
-                    episode, reward = task.load_checkpoint(agent.actor_critic, checkpoint_path)
+                    reward = task.load_checkpoint(agent.actor_critic, checkpoint_path)
             
             imgui.end()
 
