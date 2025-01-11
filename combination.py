@@ -1,3 +1,5 @@
+# TESTER PROGRAM TO COMBINE POSE TRACKING WITH A MUJOCO SIMULATION
+
 import cv2
 import mediapipe as mp
 import time
