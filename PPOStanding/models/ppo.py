@@ -9,11 +9,10 @@ from config.config import *
 
 class PPO:
     def __init__(self, state_dim, action_dim):
-        #self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.device = torch.device("cpu") # i added functionality for gpu simulation but it is actually slower than cpu for this task
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         self.actor_critic = ActorCritic(state_dim, action_dim).to(self.device)
-        self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=0.0005)
+        self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=LEARNING_RATE)
         
         self.clip_param = CLIP_PARAM
         self.ppo_epochs = PPO_EPOCHS
