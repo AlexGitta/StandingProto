@@ -20,7 +20,7 @@ LEARNING_RATE = 0.0005
 CLIP_PARAM = 0.2 # increase if stuck in local minima
 PPO_EPOCHS = 4 # increase if training too slowly
 LOSS_COEF = 0.9 # higher = emphasis on value function, lower = emphasis on policy improvement
-ENTROPY_COEF = 0.0005 # increase for more exploration
+ENTROPY_COEF = 0.001 # increase for more exploration
 
 MAX_EPISODE_STEPS = 1024
 EARLY_TERMINATION_HEIGHT = 0.9
