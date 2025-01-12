@@ -47,8 +47,11 @@ def train_headless(cpugpu, episodes = HEADLESS_EPOCHS, max_steps = MAX_EPISODE_S
         for step in range(max_steps):
             # Get action and value
             action, log_prob = agent.get_action(state)
-            _, _, value = agent.actor_critic(torch.FloatTensor(agent.normalize_state(state)).to(agent.device))
-            
+            if (cpugpu == torch.device("cuda")):
+                _, _, value = agent.actor_critic(agent.normalize_state(state))
+            if (cpugpu == torch.device("cpu")):
+                _, _, value = agent.actor_critic(torch.FloatTensor(agent.normalize_state(state)).to(agent.device))
+
             # Execute action
             task.data.ctrl = np.clip(action, -1, 1)
             mujoco.mj_step(task.model, task.data)
