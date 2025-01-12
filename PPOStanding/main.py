@@ -6,13 +6,13 @@ import imgui
 from imgui.integrations.glfw import GlfwRenderer
 import matplotlib.pyplot as plt
 import glob
-import collections
 from config.config import *
 from models.ppo import PPO
 from environment.standup_task import StandupTask
 from environment.camera import InputState, center_camera_on_humanoid
 from utils.memory import Memory
 from utils.state_utils import get_state
+from utils.replay_buffer import ReplayBuffer
 
 
 
@@ -27,13 +27,17 @@ def get_state(data):
         data.cfrc_ext.flat,
     ])
 
-def train_headless(cpugpu, episodes = HEADLESS_EPOCHS, max_steps = MAX_EPISODE_STEPS, print_epochs = 10):
+def train_headless(episodes = HEADLESS_EPOCHS, max_steps = MAX_EPISODE_STEPS, print_epochs = 10):
     task = StandupTask()
     state_dim = len(get_state(task.data))
     action_dim = task.model.nu
     agent = PPO(state_dim, action_dim)
     memory = Memory()
 
+    # Initialize replay buffer
+    buffer_capacity = BUFFER_CAP  # Adjust size as needed
+    replay_buffer = ReplayBuffer(buffer_capacity, state_dim, action_dim)
+    
     rewards_history = []
     heights_history = []
     timealive_history = []
@@ -47,11 +51,8 @@ def train_headless(cpugpu, episodes = HEADLESS_EPOCHS, max_steps = MAX_EPISODE_S
         for step in range(max_steps):
             # Get action and value
             action, log_prob = agent.get_action(state)
-            if (cpugpu == torch.device("cuda")):
-                _, _, value = agent.actor_critic(agent.normalize_state(state))
-            if (cpugpu == torch.device("cpu")):
-                _, _, value = agent.actor_critic(torch.FloatTensor(agent.normalize_state(state)).to(agent.device))
-
+            _, _, value = agent.actor_critic(torch.FloatTensor(agent.normalize_state(state)).to(agent.device))
+            
             # Execute action
             task.data.ctrl = np.clip(action, -1, 1)
             mujoco.mj_step(task.model, task.data)
@@ -63,21 +64,50 @@ def train_headless(cpugpu, episodes = HEADLESS_EPOCHS, max_steps = MAX_EPISODE_S
 
             all_height += height
             
-            # Store transition
+            # Check if episode is done
+            torso_height = task.data.xpos[task.model.body('torso').id][2]
+            done = torso_height < EARLY_TERMINATION_HEIGHT or step >= MAX_EPISODE_STEPS
+            
+            # Store in replay buffer
+            replay_buffer.add(state, action, reward, next_state, value.cpu().item(), log_prob, done)
+            
+            # Store in regular memory for PPO update
             memory.add(state, action, reward, value.cpu().item(), log_prob)
+            
+            episode_reward += reward
+            episode_steps += 1
+            all_height += height
+            
             agent.update_state_stats(next_state)
             state = next_state
             
             # Train periodically
             if len(memory.states) >= TRAIN_INTERVAL:
+               # First train on current experiences
                 agent.train(memory)
                 memory.clear()
                 
+                # Then train on a batch of replay experiences
+                if replay_buffer.size > 1000:  # Wait until buffer has enough samples
+                    replay_batch_size = 1024  # Adjust as needed
+                    replay_states, replay_actions, replay_rewards, replay_next_states, \
+                    replay_values, replay_log_probs, replay_masks = replay_buffer.sample(replay_batch_size)
+                    
+                    # Create temporary memory with sampled experiences
+                    replay_memory = Memory()
+                    for i in range(replay_batch_size):
+                        replay_memory.add(
+                            replay_states[i].numpy(),
+                            replay_actions[i].numpy(),
+                            replay_rewards[i].item(),
+                            replay_values[i].item(),
+                            replay_log_probs[i].item()
+                        )
+                    agent.train(replay_memory)
+                
 
-            torso_height = task.data.xpos[task.model.body('torso').id][2]
-            if torso_height < EARLY_TERMINATION_HEIGHT or step >= MAX_EPISODE_STEPS:
-               # agent.train(memory)
-              #  memory.clear()
+            
+            if done:
                 break
         
         if episode % print_epochs == 0:
@@ -119,9 +149,6 @@ def train_headless(cpugpu, episodes = HEADLESS_EPOCHS, max_steps = MAX_EPISODE_S
 
 def main():
     task = StandupTask()
-    # cpugpu = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    cpugpu = torch.device("cpu") # i added functionality for gpu simulation but it is actually slower than cpu for this task
     if VISUALISE:
         
         input_state = InputState()
@@ -228,11 +255,7 @@ def main():
             if not paused:
                 # Get action from policy
                 action, log_prob = agent.get_action(state)
-                if (cpugpu == torch.device("cuda")):
-                    _, _, value = agent.actor_critic(agent.normalize_state(state))
-                if (cpugpu == torch.device("cpu")):
-                    _, _, value = agent.actor_critic(torch.FloatTensor(agent.normalize_state(state)).to(agent.device))
-
+                _, _, value = agent.actor_critic(torch.FloatTensor(agent.normalize_state(state)).to(agent.device))
                 
                 # Execute action
                 task.data.ctrl = np.clip(action, -1, 1)
@@ -270,7 +293,7 @@ def main():
                         print(f"Checkpoint saved at episode {episode}")
                     task.episode_steps = 0
                     episode += 1
-                   # agent.train(memory) # train at end of episode
+                   
                     state = task.reset(task.data)
 
             center_camera_on_humanoid(camera,task.data,task.model)
@@ -330,7 +353,7 @@ def main():
             # Render ImGui
             imgui.render()
             
-            # Original rendering code
+            # Mujoco rendering code
             viewport = mujoco.MjrRect(0, 0, 0, 0)
             viewport.width, viewport.height = glfw.get_framebuffer_size(window)
             
@@ -354,7 +377,7 @@ def main():
         glfw.terminate()
     
     else:
-        train_headless(cpugpu)
+        train_headless()
 
 if __name__ == "__main__":
     main()
