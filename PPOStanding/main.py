@@ -27,7 +27,7 @@ def get_state(data):
         data.cfrc_ext.flat,
     ])
 
-def train_headless(episodes = HEADLESS_EPOCHS, max_steps = MAX_EPISODE_STEPS, print_epochs = 10):
+def train_headless(cpugpu, episodes = HEADLESS_EPOCHS, max_steps = MAX_EPISODE_STEPS, print_epochs = 10):
     task = StandupTask()
     state_dim = len(get_state(task.data))
     action_dim = task.model.nu
@@ -225,7 +225,11 @@ def main():
             if not paused:
                 # Get action from policy
                 action, log_prob = agent.get_action(state)
-                _, _, value = agent.actor_critic(torch.FloatTensor(agent.normalize_state(state)).to(agent.device))
+                if (cpugpu == torch.device("cuda")):
+                    _, _, value = agent.actor_critic(agent.normalize_state(state))
+                if (cpugpu == torch.device("cpu")):
+                    _, _, value = agent.actor_critic(torch.FloatTensor(agent.normalize_state(state)).to(agent.device))
+
                 
                 # Execute action
                 task.data.ctrl = np.clip(action, -1, 1)
@@ -347,7 +351,7 @@ def main():
         glfw.terminate()
     
     else:
-        train_headless()
+        train_headless(cpugpu)
 
 if __name__ == "__main__":
     main()
