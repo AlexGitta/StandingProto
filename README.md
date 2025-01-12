@@ -14,3 +14,7 @@ In a conda environment
 pip install torch
 
 pip install mujoco imgui matplotlib
+
+
+https://github.com/user-attachments/assets/fb6fe156-3f1d-4d4e-8037-dea64cd19499
+
