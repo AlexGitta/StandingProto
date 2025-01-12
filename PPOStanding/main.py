@@ -116,6 +116,9 @@ def train_headless(episodes = HEADLESS_EPOCHS, max_steps = MAX_EPISODE_STEPS, pr
 
 def main():
     task = StandupTask()
+    # cpugpu = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    cpugpu = torch.device("cpu") # i added functionality for gpu simulation but it is actually slower than cpu for this task
     if VISUALISE:
         
         input_state = InputState()
