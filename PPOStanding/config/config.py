@@ -1,10 +1,10 @@
 import os
 
 # Constants
-VISUALISE = False # change to choose simulation or headless
+VISUALISE = True # change to choose simulation or headless
 TARGET_HEIGHT = 1.43
 SAVE_AT_EPOCH = 2000
-HEADLESS_EPOCHS = 10000
+HEADLESS_EPOCHS = 100000
 PRINT_EPOCHS=10
 PLOT_STEPS = 500
 BUFFER_CAP = 100000
