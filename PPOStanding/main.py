@@ -59,14 +59,11 @@ def train_headless(episodes = HEADLESS_EPOCHS, max_steps = MAX_EPISODE_STEPS, pr
             next_state = get_state(task.data)
             reward, height = task.calculate_reward(task.data)
 
-            episode_reward += reward
-            episode_steps += 1
-
             all_height += height
             
             # Check if episode is done
-            torso_height = task.data.xpos[task.model.body('torso').id][2]
-            done = torso_height < EARLY_TERMINATION_HEIGHT or step >= MAX_EPISODE_STEPS
+            head_height = task.data.xpos[task.model.body('head').id][2]
+            done = head_height < EARLY_TERMINATION_HEIGHT or step >= MAX_EPISODE_STEPS
             
             # Store in replay buffer
             replay_buffer.add(state, action, reward, next_state, value.cpu().item(), log_prob, done)
@@ -111,7 +108,7 @@ def train_headless(episodes = HEADLESS_EPOCHS, max_steps = MAX_EPISODE_STEPS, pr
                 break
         
         if episode % print_epochs == 0:
-            print(f"Episode {episode}, Average Reward: {episode_reward/episode_steps:.3f} , Lasted {episode_steps} steps")
+            print(f"Episode {episode}, Average Reward: {episode_reward/episode_steps:.5f} , Total Reward: {episode_reward:.5f} Lasted {episode_steps} steps")
 
         if episode % SAVE_AT_EPOCH == 0 and episode != 0:
             task.save_checkpoint(agent.actor_critic, task.total_steps, reward)
@@ -284,10 +281,10 @@ def main():
                 state = next_state
 
                 # Check episode end
-                torso_height = task.data.xpos[task.model.body('torso').id][2]
-                if task.episode_steps >= MAX_EPISODE_STEPS or torso_height < EARLY_TERMINATION_HEIGHT:
+                head_height = task.data.xpos[task.model.body('head').id][2]
+                if task.episode_steps >= MAX_EPISODE_STEPS or head_height < EARLY_TERMINATION_HEIGHT:
                     print(f"Episode " +str(episode)+ " ended after ", task.episode_steps, "steps")
-                    print(f"Average episode reward: {task.total_reward / task.episode_steps:.3f}")
+                    print(f"Average episode reward: {task.total_reward / task.episode_steps}")
                     if episode % SAVE_AT_EPOCH == 0 and episode != 0:
                         task.save_checkpoint(agent.actor_critic, task.total_steps, reward)
                         print(f"Checkpoint saved at episode {episode}")
