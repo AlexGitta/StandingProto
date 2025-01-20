@@ -12,6 +12,9 @@ class StandupTask:
             humanoid = f.read()
             self.model = mujoco.MjModel.from_xml_string(humanoid)
             self.data = mujoco.MjData(self.model)
+
+        self.initial_pose = self.data.qpos.copy()
+        self.last_height = self.data.xpos[self.model.body('head').id][2]
         self.total_steps = 0
         self.total_reward = 0
         self.checkpoint_dir = "checkpoints"
@@ -52,34 +55,44 @@ class StandupTask:
     def calculate_reward(self, data):
         head_height = data.xpos[self.model.body('head').id][2]
 
-        height_diff = abs(head_height - TARGET_HEIGHT)
-        height_ratio = max(-1, 1 - (height_diff / TARGET_HEIGHT))  # 1 when perfect, -1 when far off
-        survival_bonus = HEALTH_COST_WEIGHT * self.episode_steps * height_ratio
+        time_bonus = 0.01 * self.episode_steps
 
-        # Control cost (unchanged)
-        quad_ctrl_cost =  np.sum(np.square(data.ctrl))
-        quad_ctrl_cost = CTRL_COST_WEIGHT * np.clip(quad_ctrl_cost, 0, 1)
+        # Calculate feet on ground reward
+        feet_on_ground = FEET_COST_WEIGHT * (np.exp(-5.0 * data.xpos[self.model.body('foot_left').id][2]) * np.exp(-5.0 * data.xpos[self.model.body('foot_right').id][2]))
+
+        # Calculate survival bonus
+        height_diff = abs(head_height - TARGET_HEIGHT)
+    # Height reward
+        height_diff = abs(head_height - TARGET_HEIGHT)
+        height_reward = max(0, 1 - (height_diff / TARGET_HEIGHT))  # 1 when perfect, 0 when far off
+
+        # Control cost
+        quad_ctrl_cost = np.sum(np.square(data.ctrl))
+        control_cost = CTRL_COST_WEIGHT * quad_ctrl_cost
+
+        # Balance reward
+        torso_orientation = data.xmat[self.model.body('torso').id].reshape(3, 3)
+        balance_reward = max(0, 1 - abs(torso_orientation[2, 2] - 1.0))  # 1 when upright, 0 when not
 
         # Final reward
-        reward =  survival_bonus - quad_ctrl_cost
-
-        if(self.episode_steps % 10 == 0 and VISUALISE):
-            print(f"Height: {head_height:.2f}")
-          #  print(f"Height Ratio: {height_ratio:.2f}")
-            print(f"Height Ratio: {height_ratio:.2f}")
-            print(f"Survival Bonus: {survival_bonus:.2f}")
-            print(f"Control Cost: {quad_ctrl_cost:.2f}")
+        reward = (height_reward + balance_reward  + feet_on_ground + time_bonus) - control_cost
+        if self.episode_steps % 1 == 0 and VISUALISE:  # print off current states for debugging
+            print(f"Height: {head_height}")
+            print(f"Time bonus: {time_bonus}")
+            print(f"Height Reward: {height_reward:.2f}")
+            print(f"Control Cost: {control_cost:.2f}")
+            print(f"Balance Reward: {balance_reward:.2f}")
+            print(f"Feet on Ground: {feet_on_ground:.2f}")
             print(f"Total Reward: {reward:.2f}")
+
+            self.last_height = head_height
 
         return reward, head_height
     
-    def reset(self, data):
-            # Use the supine pose 
-            #starting_pose = model.key_qpos[5]  
-            #data.qpos[:] = starting_pose
+    def reset(self, data):         
             mujoco.mj_resetData(self.model, data)
             data.qvel[:] = 0
             mujoco.mj_forward(self.model, data)   
+            self.last_height = self.data.xpos[self.model.body('head').id][2]
             self.episode_steps = 0
-            self.total_reward = 0
             return get_state(data)
