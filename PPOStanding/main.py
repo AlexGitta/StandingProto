@@ -59,10 +59,8 @@ def train_headless(episodes = HEADLESS_EPOCHS, max_steps = MAX_EPISODE_STEPS, pr
             next_state = get_state(task.data)
             reward, height = task.calculate_reward(task.data)
 
-            all_height += height
-            
             # Check if episode is done
-            head_height = task.data.xpos[task.model.body('head').id][2]
+            head_height = task.data.xpos[task.model.body('torso').id][2]
             done = head_height < EARLY_TERMINATION_HEIGHT or step >= MAX_EPISODE_STEPS
             
             # Store in replay buffer
@@ -77,18 +75,16 @@ def train_headless(episodes = HEADLESS_EPOCHS, max_steps = MAX_EPISODE_STEPS, pr
             
             agent.update_state_stats(next_state)
             state = next_state
+            if done:
+                break
             
-            # Train periodically
-            if len(memory.states) >= TRAIN_INTERVAL:
-               # First train on current experiences
-                agent.train(memory)
-                memory.clear()
+        if replay_buffer.size > 1024 and episode % 10 == 0:  # Wait until buffer has enough samples
+                replay_batch_size = 1024
+                sampled_data = replay_buffer.sample(replay_batch_size)
                 
-                # Then train on a batch of replay experiences
-                if replay_buffer.size > 1000:  # Wait until buffer has enough samples
-                    replay_batch_size = 1024  # Adjust as needed
-                    replay_states, replay_actions, replay_rewards, replay_next_states, \
-                    replay_values, replay_log_probs, replay_masks = replay_buffer.sample(replay_batch_size)
+                if sampled_data is not None:
+                    (replay_states, replay_actions, replay_rewards, replay_next_states,
+                    replay_values, replay_log_probs, replay_masks, weights, indices) = sampled_data
                     
                     # Create temporary memory with sampled experiences
                     replay_memory = Memory()
@@ -100,12 +96,15 @@ def train_headless(episodes = HEADLESS_EPOCHS, max_steps = MAX_EPISODE_STEPS, pr
                             replay_values[i].item(),
                             replay_log_probs[i].item()
                         )
+                    
+                    # Train on replay buffer
                     agent.train(replay_memory)
-                
+                    
+                    # Update priorities based on rewards
+                    replay_buffer.update_priorities(indices, replay_rewards.numpy())
 
             
-            if done:
-                break
+            
         
         if episode % print_epochs == 0:
             print(f"Episode {episode}, Average Reward: {episode_reward/episode_steps:.5f} , Total Reward: {episode_reward:.5f} Lasted {episode_steps} steps")
@@ -281,7 +280,7 @@ def main():
                 state = next_state
 
                 # Check episode end
-                head_height = task.data.xpos[task.model.body('head').id][2]
+                head_height = task.data.xpos[task.model.body('torso').id][2]
                 if task.episode_steps >= MAX_EPISODE_STEPS or head_height < EARLY_TERMINATION_HEIGHT:
                     print(f"Episode " +str(episode)+ " ended after ", task.episode_steps, "steps")
                     print(f"Average episode reward: {task.total_reward / task.episode_steps}")
